@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -32,11 +33,34 @@ type Provider struct {
 	ID          string    `json:"id"`
 	Name        string    `json:"name"`
 	BaseURL     string    `json:"base_url"`
-	APIKey      string    `json:"api_key"`
+	APIKeys     []string  `json:"api_keys"`     // multiple tokens for rotation
 	Enabled     bool      `json:"enabled"`
-	Prefix      string    `json:"prefix"`       // USER-DEFINED, e.g. "or", "openai", "ant"
-	Models      []string  `json:"models"`       // cached from fetch
-	ModelsFetch time.Time `json:"models_fetch"` // last fetch time
+	Prefix      string    `json:"prefix"`        // USER-DEFINED, e.g. "or", "openai", "ant"
+	Models      []string  `json:"models"`        // cached from fetch
+	ModelsFetch time.Time `json:"models_fetch"`  // last fetch time
+	rrCounter   uint64    `json:"-"`             // round-robin counter (in-memory only)
+}
+
+// RotateKey returns the next API key for this provider using round-robin.
+// First call picks key 0, next picks key 1, ... wraps around. Thread-safe.
+func (p *Provider) RotateKey() string {
+	if len(p.APIKeys) == 0 {
+		return ""
+	}
+	if len(p.APIKeys) == 1 {
+		return p.APIKeys[0]
+	}
+	idx := atomic.AddUint64(&p.rrCounter, 1) - 1
+	return p.APIKeys[int(idx%uint64(len(p.APIKeys)))]
+}
+
+// MaskKeys returns masked preview of all keys (for display).
+func (p *Provider) MaskKeys() []string {
+	out := make([]string, len(p.APIKeys))
+	for i, k := range p.APIKeys {
+		out[i] = maskKey(k)
+	}
+	return out
 }
 
 type ModelEntry struct {
@@ -79,7 +103,42 @@ func (c *Config) load() {
 		c.saveLocked()
 		return
 	}
-	json.Unmarshal(data, c)
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err == nil {
+		json.Unmarshal(data, c)
+
+		// Migration: old schema had "api_key" (single string) per provider.
+		// New schema has "api_keys" ([]string). Move old value if present.
+		if provsRaw, ok := raw["providers"]; ok {
+			var provs []json.RawMessage
+			if err := json.Unmarshal(provsRaw, &provs); err == nil {
+				for i := range c.Providers {
+					if i >= len(provs) {
+						break
+					}
+					var pmap map[string]any
+					if err := json.Unmarshal(provs[i], &pmap); err != nil {
+						continue
+					}
+					if c.Providers[i].APIKeys == nil {
+						if v, ok := pmap["api_key"].(string); ok && v != "" {
+							c.Providers[i].APIKeys = []string{v}
+						} else if arr, ok := pmap["api_keys"].([]any); ok {
+							for _, k := range arr {
+								if s, ok := k.(string); ok && s != "" {
+									c.Providers[i].APIKeys = append(c.Providers[i].APIKeys, s)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	} else {
+		json.Unmarshal(data, c)
+	}
+
 	if c.Settings.Port == 0 {
 		c.Settings.Port = 9988
 	}
@@ -118,7 +177,11 @@ func (c *Config) FetchModels(prov *Provider) error {
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+prov.APIKey)
+	firstKey := ""
+	if len(prov.APIKeys) > 0 {
+		firstKey = prov.APIKeys[0]
+	}
+	req.Header.Set("Authorization", "Bearer "+firstKey)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
@@ -437,7 +500,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Header = r.Header.Clone()
-	req.Header.Set("Authorization", "Bearer "+target.APIKey)
+	req.Header.Set("Authorization", "Bearer "+target.RotateKey())
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Del("Host")
 	req.ContentLength = int64(len(newBody))
@@ -462,7 +525,22 @@ func (p *Proxy) handleInternalAPI(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case path == "/providers" && r.Method == "GET":
-		json.NewEncoder(w).Encode(p.config.EnabledProviders())
+		// Sanitize: mask keys in API response so we don't leak secrets over HTTP
+		out := make([]map[string]any, 0, len(p.config.Providers))
+		for _, pr := range p.config.Providers {
+			out = append(out, map[string]any{
+				"id":          pr.ID,
+				"name":        pr.Name,
+				"base_url":    pr.BaseURL,
+				"enabled":     pr.Enabled,
+				"prefix":      pr.Prefix,
+				"models":      pr.Models,
+				"models_fetch": pr.ModelsFetch,
+				"key_count":   len(pr.APIKeys),
+				"api_keys":    pr.MaskKeys(),
+			})
+		}
+		json.NewEncoder(w).Encode(out)
 
 	case path == "/providers" && r.Method == "POST":
 		var prov Provider
@@ -473,6 +551,29 @@ func (p *Proxy) handleInternalAPI(w http.ResponseWriter, r *http.Request) {
 		p.config.Providers = append(p.config.Providers, prov)
 		p.config.save()
 		json.NewEncoder(w).Encode(map[string]any{"ok": true, "id": prov.ID})
+
+	case path == "/providers/keys" && r.Method == "POST":
+		// Add an API key to an existing provider: {"id": "openrouter", "api_key": "sk-or-..."}
+		var req struct {
+			ID     string `json:"id"`
+			APIKey string `json:"api_key"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			p.jsonError(w, "bad json: "+err.Error(), 400)
+			return
+		}
+		p.config.mu.Lock()
+		defer p.config.mu.Unlock()
+		for i := range p.config.Providers {
+			if p.config.Providers[i].ID == req.ID {
+				p.config.Providers[i].APIKeys = append(p.config.Providers[i].APIKeys, req.APIKey)
+				count := len(p.config.Providers[i].APIKeys)
+				p.config.saveLocked()
+				json.NewEncoder(w).Encode(map[string]any{"ok": true, "id": req.ID, "key_count": count})
+				return
+			}
+		}
+		p.jsonError(w, "provider not found: "+req.ID, 404)
 
 	case path == "/models" && r.Method == "GET":
 		json.NewEncoder(w).Encode(p.config.GetAllModels())
@@ -526,7 +627,10 @@ Usage:
   gorout stop                     Stop running server
   gorout status                   Show server status
   gorout config                   Show config
-  gorout add-provider             Add AI provider (interactive)
+  gorout list-providers           List all providers (with token count)
+  gorout add-provider             Add AI provider (interactive, supports multi-token rotation)
+  gorout add-key <provider>       Add another API key to existing provider
+  gorout remove-key <provider>    Remove an API key from provider (by index)
   gorout fetch-models             Fetch models from all providers
   gorout list-models              List all models with prefixes
   gorout generate-key --label X   Generate API key
@@ -639,9 +743,9 @@ func main() {
 		fmt.Print("Base URL (e.g. https://api.openai.com/v1): ")
 		var baseURL string
 		fmt.Scanln(&baseURL)
-		fmt.Print("API Key: ")
-		var apiKey string
-		fmt.Scanln(&apiKey)
+		fmt.Print("API Key 1: ")
+		var apiKey1 string
+		fmt.Scanln(&apiKey1)
 		fmt.Print("Prefix (custom, e.g. or, openai, ant): ")
 		var prefix string
 		fmt.Scanln(&prefix)
@@ -649,19 +753,65 @@ func main() {
 			prefix = name
 		}
 
+		// Optional: ask for extra tokens for rotation
+		var apiKeys []string
+		if apiKey1 != "" {
+			apiKeys = append(apiKeys, apiKey1)
+		}
+		fmt.Print("Add another API key for rotation? (y/N): ")
+		var ans string
+		fmt.Scanln(&ans)
+		for strings.EqualFold(ans, "y") || strings.EqualFold(ans, "yes") {
+			fmt.Print("API Key: ")
+			var k string
+			fmt.Scanln(&k)
+			if k != "" {
+				apiKeys = append(apiKeys, k)
+			}
+			fmt.Print("Add another? (y/N): ")
+			fmt.Scanln(&ans)
+		}
+
 		prov := Provider{
 			ID:      name,
 			Name:    name,
 			BaseURL: baseURL,
-			APIKey:  apiKey,
+			APIKeys: apiKeys,
 			Enabled: true,
 			Prefix:  prefix,
 		}
 		cfg.Providers = append(cfg.Providers, prov)
 		cfg.save()
-		fmt.Printf("✅ Provider '%s' added (prefix: %s)\n", name, prefix)
+		fmt.Printf("✅ Provider '%s' added (prefix: %s, %d API key(s) for rotation)\n", name, prefix, len(apiKeys))
 		fmt.Printf("   Models will be: %s/<model-name>\n", prefix)
 		fmt.Printf("   Run 'gorout fetch-models' to get available models\n")
+		if len(apiKeys) > 1 {
+			fmt.Printf("   Tokens will rotate round-robin across %d keys\n", len(apiKeys))
+		}
+
+	case "list-providers":
+		if len(cfg.Providers) == 0 {
+			fmt.Println("No providers configured.")
+			fmt.Println("Add one with: gorout add-provider")
+			os.Exit(0)
+		}
+		fmt.Printf("Providers (%d):\n\n", len(cfg.Providers))
+		fmt.Printf("  %-5s %-20s %-40s %-12s %s\n", "ON", "ID", "BASE URL", "PREFIX", "KEYS")
+		fmt.Println("  " + strings.Repeat("-", 95))
+		for _, p := range cfg.Providers {
+			onOff := "✗"
+			if p.Enabled {
+				onOff = "✓"
+			}
+			base := p.BaseURL
+			if len(base) > 38 {
+				base = base[:35] + "..."
+			}
+			masked := p.MaskKeys()
+			fmt.Printf("  %-5s %-20s %-40s %-12s %d token(s): %s\n",
+				onOff, p.ID, base, p.Prefix, len(p.APIKeys), strings.Join(masked, ", "))
+		}
+		fmt.Printf("\nTotal models cached: %d\n", len(cfg.GetAllModels()))
 
 	case "fetch-models":
 		fmt.Println("🔄 Fetching models from all providers...")
@@ -754,6 +904,67 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Printf("✅ API key '%s' deleted\n", label)
+
+	case "remove-key":
+		if len(os.Args) < 4 {
+			fmt.Println("❌ Usage: gorout remove-key <provider-id> <index>")
+			os.Exit(1)
+		}
+		provID := os.Args[2]
+		idx, err := strconv.Atoi(os.Args[3])
+		if err != nil {
+			fmt.Printf("❌ Index must be a number, got: %s\n", os.Args[3])
+			os.Exit(1)
+		}
+		cfg.mu.Lock()
+		defer cfg.mu.Unlock()
+		for i := range cfg.Providers {
+			if cfg.Providers[i].ID != provID {
+				continue
+			}
+			if idx < 0 || idx >= len(cfg.Providers[i].APIKeys) {
+				fmt.Printf("❌ Index %d out of range (have %d key(s))\n", idx, len(cfg.Providers[i].APIKeys))
+				os.Exit(1)
+			}
+			if len(cfg.Providers[i].APIKeys) == 1 {
+				fmt.Printf("❌ Cannot remove last key for provider '%s' (need at least 1)\n", provID)
+				os.Exit(1)
+			}
+			cfg.Providers[i].APIKeys = append(cfg.Providers[i].APIKeys[:idx], cfg.Providers[i].APIKeys[idx+1:]...)
+			cfg.saveLocked()
+			fmt.Printf("✅ Removed key #%d from provider '%s' (%d key(s) left)\n", idx, provID, len(cfg.Providers[i].APIKeys))
+			return
+		}
+		fmt.Printf("❌ Provider '%s' not found\n", provID)
+		os.Exit(1)
+
+	case "add-key":
+		if len(os.Args) < 3 {
+			fmt.Println("❌ Usage: gorout add-key <provider-id>")
+			fmt.Println("   Then paste the API key when prompted")
+			os.Exit(1)
+		}
+		provID := os.Args[2]
+		fmt.Print("API Key to add: ")
+		var newKey string
+		fmt.Scanln(&newKey)
+		if newKey == "" {
+			fmt.Println("❌ Empty key, aborting")
+			os.Exit(1)
+		}
+		cfg.mu.Lock()
+		defer cfg.mu.Unlock()
+		for i := range cfg.Providers {
+			if cfg.Providers[i].ID == provID {
+				cfg.Providers[i].APIKeys = append(cfg.Providers[i].APIKeys, newKey)
+				count := len(cfg.Providers[i].APIKeys)
+				cfg.saveLocked()
+				fmt.Printf("✅ Key added to '%s' (now %d key(s), will rotate)\n", provID, count)
+				return
+			}
+		}
+		fmt.Printf("❌ Provider '%s' not found\n", provID)
+		os.Exit(1)
 
 	case "version":
 		fmt.Println("GoRout v1.0.0")
