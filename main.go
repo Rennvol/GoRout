@@ -423,15 +423,26 @@ func (c *Config) ResolveModel(modelName string) (*Provider, string) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
+	// First pass: longest-prefix match wins (avoids "or" eating "openrouter/...").
+	var matches []Provider
 	for _, p := range c.Providers {
 		if !p.Enabled {
 			continue
 		}
 		prefixSlash := p.Prefix + "/"
 		if strings.HasPrefix(modelName, prefixSlash) {
-			originalModel := strings.TrimPrefix(modelName, prefixSlash)
-			return &p, originalModel
+			matches = append(matches, p)
 		}
+	}
+	if len(matches) > 0 {
+		best := matches[0]
+		for _, m := range matches[1:] {
+			if len(m.Prefix) > len(best.Prefix) {
+				best = m
+			}
+		}
+		originalModel := strings.TrimPrefix(modelName, best.Prefix+"/")
+		return &best, originalModel
 	}
 	return nil, modelName
 }
@@ -657,7 +668,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	req.Header.Del("Host")
 	req.ContentLength = int64(len(newBody))
 
-	resp, err := p.client.Do(req)
+	// Failover: try current key, then rotate to next on retryable errors.
+	// Retryable = 401 (bad key), 429 (rate-limited), 5xx (server error).
+	// Network errors count as retryable too.
+	resp, err := p.doWithFailover(req, target)
 	if err != nil {
 		p.recordUsage(target.ID, actualModel, bodyMap, 0, 0, true)
 		p.jsonError(w, err.Error(), 502)
@@ -698,6 +712,87 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // non-OpenAI providers that omit the usage field).
 func (p *Proxy) recordUsage(provider, model string, bodyMap map[string]any, inTok, outTok uint64, isErr bool) {
 	p.config.Usage.Record(provider, model, inTok, outTok, isErr)
+}
+
+// doWithFailover sends the request, rotating keys on retryable errors.
+// Strategy:
+//   - Make request with current key.
+//   - If response is 401/429/5xx, mark it as retried and try the next key.
+//   - If body is network error, retry once with the next key.
+//   - Give up after trying every key (loop limited to N keys).
+//   - On final failure, return the LAST response / error so caller can stream it.
+//
+// Returns (response, error). Caller MUST close resp.Body when error==nil.
+func (p *Proxy) doWithFailover(req *http.Request, target *Provider) (*http.Response, error) {
+	// The body has been marshalled already; we need to re-create the reader for each attempt
+	// because net/http drains the body after a send.
+	bodyBytes := []byte(nil)
+	if req.Body != nil {
+		bodyBytes, _ = io.ReadAll(req.Body)
+		req.Body.Close()
+	}
+
+	nKeys := len(target.APIKeys)
+	if nKeys == 0 {
+		return nil, fmt.Errorf("provider %s has no API keys", target.ID)
+	}
+
+	startIdx := int(atomic.AddUint64(&target.rrCounter, 1) % uint64(nKeys))
+
+	var lastErr error
+	var lastResp *http.Response
+	for attempt := 0; attempt < nKeys; attempt++ {
+		idx := (startIdx + attempt) % nKeys
+		key := target.APIKeys[idx]
+
+		// Rebuild request with fresh body reader
+		req2, err := http.NewRequest(req.Method, req.URL.String(), bytes.NewReader(bodyBytes))
+		if err != nil {
+			return nil, err
+		}
+		req2.Header = req.Header.Clone()
+		req2.Header.Set("Authorization", "Bearer "+key)
+		req2.ContentLength = int64(len(bodyBytes))
+
+		resp, err := p.client.Do(req2)
+		if err != nil {
+			lastErr = err
+			p.logger.Printf("FAILOVER: provider=%s key=%d network err=%v (trying next)", target.ID, idx+1, err)
+			continue
+		}
+
+		// 2xx = success, return immediately
+		if resp.StatusCode < 400 {
+			if attempt > 0 {
+				p.logger.Printf("FAILOVER: provider=%s recovered on key=%d (status=%d)", target.ID, idx+1, resp.StatusCode)
+			}
+			return resp, nil
+		}
+
+		// Non-2xx: hold onto the latest response. Decide if we should retry.
+		retryable := resp.StatusCode == 401 || resp.StatusCode == 429 || resp.StatusCode >= 500
+		if !retryable {
+			// 4xx other than 401/429 — client error, not a key problem. Return immediately.
+			return resp, nil
+		}
+
+		// Drain + close this attempt's body so the connection can be reused.
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		// If this was the last key we can try, give up and return a synthesized error.
+		if attempt == nKeys-1 {
+			return nil, fmt.Errorf("all %d key(s) exhausted for provider %s (last status: %d)", nKeys, target.ID, resp.StatusCode)
+		}
+		lastResp = resp
+		p.logger.Printf("FAILOVER: provider=%s key=%d status=%d retrying", target.ID, idx+1, resp.StatusCode)
+	}
+
+	// All attempts failed at the network layer
+	if lastResp != nil {
+		return nil, fmt.Errorf("upstream error after %d attempts: %d", nKeys, lastResp.StatusCode)
+	}
+	return nil, fmt.Errorf("upstream unreachable: %v", lastErr)
 }
 
 // parseJSONUsage extracts usage from a non-streaming OpenAI response.
@@ -881,7 +976,10 @@ Usage:
   gorout usage                    Show usage stats (total + per-provider + per-model)
   gorout usage-reset              Reset all usage counters
   gorout fetch-models             Fetch models from all providers
+  gorout fetch-models-one <id>    Fetch models from one provider
   gorout list-models              List all models with prefixes
+  gorout list-models <provider>   List models for one provider
+  gorout test-model <provider>/<model>  Test one model (1 request, prints tokens)
   gorout generate-key --label X   Generate API key
   gorout list-keys                List all API keys (masked)
   gorout view <label>             Show full API key
@@ -931,6 +1029,18 @@ func main() {
 		fmt.Printf("    API Keys:  %d\n", len(cfg.APIKeys))
 		fmt.Printf("    Models:    %d\n", len(cfg.GetAllModels()))
 		fmt.Printf("    PID: %d\n\n", os.Getpid())
+
+		// Open log file for failover / proxy diagnostics
+		logPath := filepath.Join(home, "server.log")
+		logFile, logErr := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		if logErr != nil {
+			log.Printf("⚠️  Cannot open %s: %v (using stdout)", logPath, logErr)
+		} else {
+			mw := io.MultiWriter(os.Stdout, logFile)
+			log.SetOutput(mw)
+			// Also redirect the proxy's logger (used in ServeHTTP / doWithFailover)
+			proxy.logger = log.New(mw, "[gorout] ", log.LstdFlags)
+		}
 
 		// Auto-fetch models on startup
 		go func() {
@@ -1069,17 +1179,219 @@ func main() {
 			fmt.Printf("  %s: %s\n", id, result)
 		}
 
+	case "fetch-models-one":
+		if len(os.Args) < 3 {
+			fmt.Println("❌ Usage: gorout fetch-models-one <provider-id>")
+			os.Exit(1)
+		}
+		provID := os.Args[2]
+		var prov *Provider
+		for i := range cfg.Providers {
+			if cfg.Providers[i].ID == provID {
+				prov = &cfg.Providers[i]
+				break
+			}
+		}
+		if prov == nil {
+			fmt.Printf("❌ Provider '%s' not found\n", provID)
+			os.Exit(1)
+		}
+		fmt.Printf("🔄 Fetching models from provider '%s' (%s)...\n", prov.ID, prov.BaseURL)
+		if err := cfg.FetchModels(prov); err != nil {
+			fmt.Printf("❌ %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("✅ Cached %d models for '%s'\n", len(prov.Models), prov.ID)
+
 	case "list-models":
+		// Optional filter: list-models <provider-id>
+		filter := ""
+		if len(os.Args) >= 3 {
+			filter = os.Args[2]
+		}
 		models := cfg.GetAllModels()
+		if filter != "" {
+			filtered := models[:0]
+			for _, m := range models {
+				if m.Provider == filter {
+					filtered = append(filtered, m)
+				}
+			}
+			models = filtered
+		}
 		if len(models) == 0 {
-			fmt.Println("No models cached. Run: gorout fetch-models")
+			if filter != "" {
+				fmt.Printf("No models cached for provider '%s'. Run: gorout fetch-models-one %s\n", filter, filter)
+			} else {
+				fmt.Println("No models cached. Run: gorout fetch-models")
+			}
 			os.Exit(0)
 		}
-		fmt.Printf("Models (%d):\n\n", len(models))
-		fmt.Printf("  %-55s %-15s\n", "MODEL ID", "PROVIDER")
-		fmt.Println("  " + strings.Repeat("-", 70))
+		fmt.Printf("Models (%d", len(models))
+		if filter != "" {
+			fmt.Printf(", provider=%s", filter)
+		}
+		fmt.Println("):\n")
+		fmt.Printf("  %-55s %-15s %s\n", "MODEL ID", "PROVIDER", "PREFIX")
+		fmt.Println("  " + strings.Repeat("-", 85))
 		for _, m := range models {
-			fmt.Printf("  %-55s %-15s\n", m.ID, m.Provider)
+			fmt.Printf("  %-55s %-15s %s\n", m.ID, m.Provider, m.Prefix)
+		}
+
+	case "test-model":
+		if len(os.Args) < 3 {
+			fmt.Println("❌ Usage: gorout test-model <provider>/<model> [--prompt \"text\"] [--max-tokens N]")
+			fmt.Println("   Examples:")
+			fmt.Println("     gorout test-model openai/gpt-4o-mini")
+			fmt.Println("     gorout test-model nine/duadua --prompt \"hello\" --max-tokens 50")
+			os.Exit(1)
+		}
+		modelArg := os.Args[2]
+		prompt := "Say 'ok' in exactly 2 words."
+		maxTokens := 20
+		stream := false
+		for i := 3; i < len(os.Args); i++ {
+			arg := os.Args[i]
+			switch {
+			case arg == "--prompt" && i+1 < len(os.Args):
+				prompt = os.Args[i+1]
+				i++
+			case arg == "--max-tokens" && i+1 < len(os.Args):
+				if n, err := strconv.Atoi(os.Args[i+1]); err == nil {
+					maxTokens = n
+				}
+				i++
+			case arg == "--stream":
+				stream = true
+			}
+		}
+
+		prov, resolvedModel := cfg.ResolveModel(modelArg)
+		if prov == nil {
+			fmt.Printf("❌ Provider for '%s' not found. Use prefix like 'openai/gpt-4o-mini' or 'ant/claude-sonnet-4-5'\n", modelArg)
+			os.Exit(1)
+		}
+		if len(prov.APIKeys) == 0 {
+			fmt.Printf("❌ Provider '%s' has no API keys. Run: gorout add-key %s\n", prov.ID, prov.ID)
+			os.Exit(1)
+		}
+
+		body := map[string]any{
+			"model":      modelArg, // keep the prefix so GoRout can route
+			"messages":   []map[string]string{{"role": "user", "content": prompt}},
+			"max_tokens": maxTokens,
+			"stream":     stream,
+		}
+		if stream {
+			body["stream_options"] = map[string]any{"include_usage": true}
+		}
+		bodyBytes, _ := json.Marshal(body)
+
+		// Reuse the first available GoRout API key (test-models runs against the local proxy).
+		var key string
+		if len(cfg.APIKeys) > 0 {
+			key = cfg.APIKeys[0].Key
+		} else {
+			fmt.Println("❌ No gorout API key. Run: gorout generate-key --label test")
+			os.Exit(1)
+		}
+
+		fmt.Printf("🧪 Testing %s/%s (provider=%s, base=%s)\n", prov.Prefix, resolvedModel, prov.ID, prov.BaseURL)
+		fmt.Printf("   prompt:    %q\n", prompt)
+		fmt.Printf("   max-tokens:%d   stream:%v\n", maxTokens, stream)
+		keyIdx := int(atomic.LoadUint64(&prov.rrCounter)) % len(prov.APIKeys)
+		fmt.Printf("   key idx:   %d/%d (rotates per call)\n", keyIdx, len(prov.APIKeys))
+		fmt.Println()
+
+		start := time.Now()
+		req, _ := http.NewRequest("POST", "http://127.0.0.1:"+strconv.Itoa(cfg.Settings.Port)+"/v1/chat/completions", bytes.NewReader(bodyBytes))
+		req.Header.Set("Authorization", "Bearer "+key)
+		req.Header.Set("Content-Type", "application/json")
+		// Skip GoRout's own auth for this localhost loopback — easier: use the key directly.
+		resp, err := http.DefaultClient.Do(req)
+		elapsed := time.Since(start)
+		if err != nil {
+			fmt.Printf("❌ Request failed (%v): %v\n", elapsed, err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		respBody, _ := io.ReadAll(resp.Body)
+
+		fmt.Printf("📥 Response: HTTP %d (%v)\n", resp.StatusCode, elapsed)
+		if resp.StatusCode >= 400 {
+			fmt.Println("❌ Error body:")
+			fmt.Println(string(respBody))
+			os.Exit(1)
+		}
+
+		if stream {
+			// Show first text delta + parse usage
+			text := ""
+			var inTok, outTok uint64
+			var modelSeen string
+			for _, line := range strings.Split(string(respBody), "\n") {
+				if !strings.HasPrefix(line, "data: ") {
+					continue
+				}
+				payload := strings.TrimPrefix(line, "data: ")
+				if payload == "[DONE]" {
+					break
+				}
+				var chunk struct {
+					Model string `json:"model"`
+					Choices []struct {
+						Delta struct {
+							Content string `json:"content"`
+						} `json:"delta"`
+					} `json:"choices"`
+					Usage *struct {
+						PromptTokens     uint64 `json:"prompt_tokens"`
+						CompletionTokens uint64 `json:"completion_tokens"`
+						TotalTokens      uint64 `json:"total_tokens"`
+					} `json:"usage"`
+				}
+				if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+					continue
+				}
+				if chunk.Model != "" {
+					modelSeen = chunk.Model
+				}
+				if len(chunk.Choices) > 0 {
+					text += chunk.Choices[0].Delta.Content
+				}
+				if chunk.Usage != nil {
+					inTok = chunk.Usage.PromptTokens
+					outTok = chunk.Usage.CompletionTokens
+				}
+			}
+			fmt.Printf("   text:    %s\n", strings.TrimSpace(text))
+			fmt.Printf("   model:   %s\n", modelSeen)
+			fmt.Printf("   tokens:  in=%d out=%d total=%d\n", inTok, outTok, inTok+outTok)
+		} else {
+			var r struct {
+				Model   string `json:"model"`
+				Choices []struct {
+					Message struct {
+						Content string `json:"content"`
+					} `json:"message"`
+				} `json:"choices"`
+				Usage struct {
+					PromptTokens     uint64 `json:"prompt_tokens"`
+					CompletionTokens uint64 `json:"completion_tokens"`
+					TotalTokens      uint64 `json:"total_tokens"`
+				} `json:"usage"`
+			}
+			if err := json.Unmarshal(respBody, &r); err == nil {
+				content := ""
+				if len(r.Choices) > 0 {
+					content = r.Choices[0].Message.Content
+				}
+				fmt.Printf("   model:   %s\n", r.Model)
+				fmt.Printf("   text:    %s\n", strings.TrimSpace(content))
+				fmt.Printf("   tokens:  in=%d out=%d total=%d\n", r.Usage.PromptTokens, r.Usage.CompletionTokens, r.Usage.TotalTokens)
+			} else {
+				fmt.Println(string(respBody))
+			}
 		}
 
 	case "generate-key":
