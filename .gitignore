@@ -1,0 +1,14 @@
+# Binary
+gorout
+*.exe
+
+# Config (contains API keys)
+config.json
+*.pid
+
+# Test files
+test_proxy.py
+
+# OS
+.DS_Store
+Thumbs.db
