@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/rand"
 	"encoding/hex"
@@ -17,6 +18,14 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+// truncStr truncates a string to max runes (not bytes), appending "..." if cut.
+func truncStr(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max-3] + "..."
+}
 
 // ==================== API Keys ====================
 
@@ -76,23 +85,156 @@ type Settings struct {
 	LogLevel string `json:"log_level"`
 }
 
+// ==================== Usage Tracking ====================
+
+// ProviderUsage tracks one provider's lifetime stats.
+type ProviderUsage struct {
+	Requests      uint64 `json:"requests"`
+	InputTokens   uint64 `json:"input_tokens"`
+	OutputTokens  uint64 `json:"output_tokens"`
+	TotalTokens   uint64 `json:"total_tokens"`
+	Errors        uint64 `json:"errors"`
+	LastRequestAt string `json:"last_request_at,omitempty"`
+}
+
+// ModelUsage tracks one model's stats within a provider.
+type ModelUsage struct {
+	Provider     string `json:"provider"`
+	Model        string `json:"model"`
+	Requests     uint64 `json:"requests"`
+	InputTokens  uint64 `json:"input_tokens"`
+	OutputTokens uint64 `json:"output_tokens"`
+	TotalTokens  uint64 `json:"total_tokens"`
+}
+
+// Usage holds aggregate stats. ByProvider keyed by id; ByModel keyed by "provider|model".
+type Usage struct {
+	StartedAt   string                    `json:"started_at"`
+	LastFlushAt string                    `json:"last_flush_at,omitempty"`
+	Total       ProviderUsage             `json:"total"`
+	ByProvider  map[string]*ProviderUsage `json:"by_provider"`
+	ByModel     map[string]*ModelUsage    `json:"by_model"`
+}
+
+func newUsage() Usage {
+	return Usage{
+		StartedAt:  time.Now().UTC().Format(time.RFC3339),
+		ByProvider: make(map[string]*ProviderUsage),
+		ByModel:    make(map[string]*ModelUsage),
+	}
+}
+
+// Record adds one request's stats. Thread-safe.
+func (u *Usage) Record(provider, model string, inTok, outTok uint64, isErr bool) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	atomic.AddUint64(&u.Total.Requests, 1)
+	atomic.AddUint64(&u.Total.InputTokens, inTok)
+	atomic.AddUint64(&u.Total.OutputTokens, outTok)
+	atomic.AddUint64(&u.Total.TotalTokens, inTok+outTok)
+	if isErr {
+		atomic.AddUint64(&u.Total.Errors, 1)
+	}
+
+	p, ok := u.ByProvider[provider]
+	if !ok {
+		p = &ProviderUsage{}
+		u.ByProvider[provider] = p
+	}
+	atomic.AddUint64(&p.Requests, 1)
+	atomic.AddUint64(&p.InputTokens, inTok)
+	atomic.AddUint64(&p.OutputTokens, outTok)
+	atomic.AddUint64(&p.TotalTokens, inTok+outTok)
+	if isErr {
+		atomic.AddUint64(&p.Errors, 1)
+	}
+	p.LastRequestAt = now
+
+	if model != "" {
+		key := provider + "|" + model
+		m, ok := u.ByModel[key]
+		if !ok {
+			m = &ModelUsage{Provider: provider, Model: model}
+			u.ByModel[key] = m
+		}
+		atomic.AddUint64(&m.Requests, 1)
+		atomic.AddUint64(&m.InputTokens, inTok)
+		atomic.AddUint64(&m.OutputTokens, outTok)
+		atomic.AddUint64(&m.TotalTokens, inTok+outTok)
+	}
+}
+
 type Config struct {
 	mu         sync.RWMutex
 	Providers  []Provider `json:"providers"`
 	APIKeys    []APIKey   `json:"api_keys"`
 	Settings   Settings   `json:"settings"`
+	Usage      Usage      `json:"usage"`
 	configPath string
+	usagePath  string
 	httpClient *http.Client
 }
 
 func NewConfig(path string) *Config {
+	usagePath := filepath.Join(filepath.Dir(path), "usage.json")
 	c := &Config{
 		configPath: path,
+		usagePath:  usagePath,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 		Settings:   Settings{Port: 9988, LogLevel: "info"},
 	}
 	c.load()
+	c.loadUsage()
+	go c.flushLoop()
 	return c
+}
+
+// loadUsage reads usage.json if present. Best-effort: missing file = empty stats.
+func (c *Config) loadUsage() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	data, err := os.ReadFile(c.usagePath)
+	if err != nil {
+		c.Usage = newUsage()
+		return
+	}
+	if err := json.Unmarshal(data, &c.Usage); err != nil {
+		c.Usage = newUsage()
+		return
+	}
+	// Ensure maps aren't nil
+	if c.Usage.ByProvider == nil {
+		c.Usage.ByProvider = make(map[string]*ProviderUsage)
+	}
+	if c.Usage.ByModel == nil {
+		c.Usage.ByModel = make(map[string]*ModelUsage)
+	}
+}
+
+// flushLoop periodically writes usage.json. 10s interval keeps disk IO low
+// while still surviving crashes with at most 10s of loss.
+func (c *Config) flushLoop() {
+	t := time.NewTicker(10 * time.Second)
+	defer t.Stop()
+	for range t.C {
+		c.saveUsage()
+	}
+}
+
+func (c *Config) saveUsage() {
+	c.mu.RLock()
+	usage := c.Usage
+	usage.LastFlushAt = time.Now().UTC().Format(time.RFC3339)
+	c.mu.RUnlock()
+
+	data, err := json.MarshalIndent(usage, "", "  ")
+	if err != nil {
+		return
+	}
+	tmp := c.usagePath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return
+	}
+	os.Rename(tmp, c.usagePath)
 }
 
 func (c *Config) load() {
@@ -483,6 +625,16 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Re-encode body
 	newBody, _ := json.Marshal(bodyMap)
 
+	// Resolve streaming intent (OpenAI "stream": true, or "stream_options.include_usage").
+	isStreaming := false
+	if s, ok := bodyMap["stream"].(bool); ok && s {
+		isStreaming = true
+	} else if so, ok := bodyMap["stream_options"].(map[string]any); ok {
+		if v, ok := so["include_usage"].(bool); ok && v {
+			isStreaming = true
+		}
+	}
+
 	// Rewrite path
 	path := r.URL.Path
 	path = strings.TrimPrefix(path, "/v1")
@@ -507,6 +659,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := p.client.Do(req)
 	if err != nil {
+		p.recordUsage(target.ID, actualModel, bodyMap, 0, 0, true)
 		p.jsonError(w, err.Error(), 502)
 		return
 	}
@@ -516,7 +669,93 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header()[k] = v
 	}
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+
+	// Buffer the upstream body so we can parse usage after streaming it to the client.
+	// OpenAI sends a `usage` chunk in the final SSE event for stream=true.
+	isErr := resp.StatusCode >= 400
+	if isStreaming {
+		// Tee: copy to client + collect into a buffer for usage parsing.
+		var buf bytes.Buffer
+		tee := io.TeeReader(resp.Body, &buf)
+		io.Copy(w, tee)
+		inTok, outTok, modelSeen := parseSSEUsage(&buf, actualModel)
+		if modelSeen == "" {
+			modelSeen = actualModel
+		}
+		p.recordUsage(target.ID, modelSeen, bodyMap, inTok, outTok, isErr)
+	} else {
+		body, _ := io.ReadAll(resp.Body)
+		w.Write(body)
+		inTok, outTok, modelSeen := parseJSONUsage(body)
+		if modelSeen == "" {
+			modelSeen = actualModel
+		}
+		p.recordUsage(target.ID, modelSeen, bodyMap, inTok, outTok, isErr)
+	}
+}
+
+// recordUsage logs one request's usage. Tokens may be 0 (e.g. on error or
+// non-OpenAI providers that omit the usage field).
+func (p *Proxy) recordUsage(provider, model string, bodyMap map[string]any, inTok, outTok uint64, isErr bool) {
+	p.config.Usage.Record(provider, model, inTok, outTok, isErr)
+}
+
+// parseJSONUsage extracts usage from a non-streaming OpenAI response.
+// Returns (input, output, model). Missing usage yields (0, 0, "").
+func parseJSONUsage(body []byte) (uint64, uint64, string) {
+	var resp struct {
+		Model string `json:"model"`
+		Usage struct {
+			PromptTokens     uint64 `json:"prompt_tokens"`
+			CompletionTokens uint64 `json:"completion_tokens"`
+			TotalTokens      uint64 `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return 0, 0, ""
+	}
+	return resp.Usage.PromptTokens, resp.Usage.CompletionTokens, resp.Model
+}
+
+// parseSSEUsage walks an SSE buffer and pulls the final usage chunk (if any).
+// Streamed responses emit one "data: {...}" per line; usage appears in the
+// chunk whose JSON has a non-null `usage` field.
+func parseSSEUsage(buf *bytes.Buffer, fallbackModel string) (uint64, uint64, string) {
+	scanner := bufio.NewScanner(buf)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	var (
+		lastIn, lastOut uint64
+		modelSeen       string
+	)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if !bytes.HasPrefix(line, []byte("data: ")) {
+			continue
+		}
+		payload := bytes.TrimPrefix(line, []byte("data: "))
+		if bytes.Equal(payload, []byte("[DONE]")) {
+			break
+		}
+		var chunk struct {
+			Model  string `json:"model"`
+			Usage  *struct {
+				PromptTokens     uint64 `json:"prompt_tokens"`
+				CompletionTokens uint64 `json:"completion_tokens"`
+				TotalTokens      uint64 `json:"total_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal(payload, &chunk); err != nil {
+			continue
+		}
+		if chunk.Model != "" {
+			modelSeen = chunk.Model
+		}
+		if chunk.Usage != nil {
+			lastIn = chunk.Usage.PromptTokens
+			lastOut = chunk.Usage.CompletionTokens
+		}
+	}
+	return lastIn, lastOut, modelSeen
 }
 
 func (p *Proxy) handleInternalAPI(w http.ResponseWriter, r *http.Request) {
@@ -575,6 +814,14 @@ func (p *Proxy) handleInternalAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		p.jsonError(w, "provider not found: "+req.ID, 404)
 
+	case path == "/usage" && r.Method == "GET":
+		json.NewEncoder(w).Encode(p.config.Usage)
+
+	case path == "/usage/reset" && r.Method == "POST":
+		p.config.Usage = newUsage()
+		p.config.saveUsage()
+		json.NewEncoder(w).Encode(map[string]any{"ok": true, "reset_at": time.Now().UTC()})
+
 	case path == "/models" && r.Method == "GET":
 		json.NewEncoder(w).Encode(p.config.GetAllModels())
 
@@ -631,6 +878,8 @@ Usage:
   gorout add-provider             Add AI provider (interactive, supports multi-token rotation)
   gorout add-key <provider>       Add another API key to existing provider
   gorout remove-key <provider>    Remove an API key from provider (by index)
+  gorout usage                    Show usage stats (total + per-provider + per-model)
+  gorout usage-reset              Reset all usage counters
   gorout fetch-models             Fetch models from all providers
   gorout list-models              List all models with prefixes
   gorout generate-key --label X   Generate API key
@@ -965,6 +1214,86 @@ func main() {
 		}
 		fmt.Printf("❌ Provider '%s' not found\n", provID)
 		os.Exit(1)
+
+	case "usage-reset":
+		cfg.Usage = newUsage()
+		cfg.saveUsage()
+		fmt.Println("✅ Usage counters reset")
+
+	case "usage":
+		if len(cfg.Usage.ByProvider) == 0 && cfg.Usage.Total.Requests == 0 {
+			fmt.Println("📊 No usage recorded yet.")
+			fmt.Println("   Make a request to a model, then run this again.")
+			os.Exit(0)
+		}
+		fmt.Printf("📊 Usage Stats\n")
+		fmt.Printf("   Tracking started: %s\n", cfg.Usage.StartedAt)
+		if cfg.Usage.LastFlushAt != "" {
+			fmt.Printf("   Last flushed:     %s\n", cfg.Usage.LastFlushAt)
+		}
+		fmt.Println()
+		fmt.Println("  TOTAL")
+		fmt.Printf("    Requests:       %d\n", cfg.Usage.Total.Requests)
+		fmt.Printf("    Input tokens:   %d\n", cfg.Usage.Total.InputTokens)
+		fmt.Printf("    Output tokens:  %d\n", cfg.Usage.Total.OutputTokens)
+		fmt.Printf("    Total tokens:   %d\n", cfg.Usage.Total.TotalTokens)
+		fmt.Printf("    Errors:         %d\n", cfg.Usage.Total.Errors)
+		fmt.Println()
+		fmt.Println("  PER PROVIDER")
+		// Sort providers by total tokens desc (simple bubble sort, n is small)
+		type pp struct {
+			id string
+			u  *ProviderUsage
+		}
+		provs := make([]pp, 0, len(cfg.Usage.ByProvider))
+		for k, v := range cfg.Usage.ByProvider {
+			provs = append(provs, pp{k, v})
+		}
+		for i := 0; i < len(provs); i++ {
+			for j := i + 1; j < len(provs); j++ {
+				if provs[j].u.TotalTokens > provs[i].u.TotalTokens {
+					provs[i], provs[j] = provs[j], provs[i]
+				}
+			}
+		}
+		fmt.Printf("    %-20s %8s %12s %12s %12s %8s\n", "PROVIDER", "REQS", "IN TOK", "OUT TOK", "TOT TOK", "ERRORS")
+		fmt.Println("    " + strings.Repeat("-", 80))
+		for _, p := range provs {
+			fmt.Printf("    %-20s %8d %12d %12d %12d %8d\n",
+				p.id, p.u.Requests, p.u.InputTokens, p.u.OutputTokens, p.u.TotalTokens, p.u.Errors)
+		}
+		fmt.Println()
+		fmt.Println("  TOP MODELS (by total tokens)")
+		type mm struct {
+			k string
+			u *ModelUsage
+		}
+		models := make([]mm, 0, len(cfg.Usage.ByModel))
+		for k, v := range cfg.Usage.ByModel {
+			models = append(models, mm{k, v})
+		}
+		// Sort by total tokens desc
+		for i := 0; i < len(models); i++ {
+			for j := i + 1; j < len(models); j++ {
+				if models[j].u.TotalTokens > models[i].u.TotalTokens {
+					models[i], models[j] = models[j], models[i]
+				}
+			}
+		}
+		limit := 10
+		if len(models) < limit {
+			limit = len(models)
+		}
+		fmt.Printf("    %-20s %-32s %6s %12s %12s %12s\n", "PROVIDER", "MODEL", "REQS", "IN TOK", "OUT TOK", "TOT TOK")
+		fmt.Println("    " + strings.Repeat("-", 100))
+		for i := 0; i < limit; i++ {
+			m := models[i].u
+			fmt.Printf("    %-20s %-32s %6d %12d %12d %12d\n",
+				m.Provider, truncStr(m.Model, 32), m.Requests, m.InputTokens, m.OutputTokens, m.TotalTokens)
+		}
+		if len(models) > limit {
+			fmt.Printf("    ... and %d more model(s)\n", len(models)-limit)
+		}
 
 	case "version":
 		fmt.Println("GoRout v1.0.0")
